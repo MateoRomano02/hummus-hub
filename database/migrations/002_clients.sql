@@ -1,0 +1,31 @@
+CREATE TABLE clients (
+  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agency_id         UUID NOT NULL REFERENCES agencies(id),
+  name              TEXT NOT NULL,
+  slug              TEXT NOT NULL,
+  status            TEXT DEFAULT 'active',
+  email             TEXT,
+  whatsapp          TEXT,
+  website           TEXT,
+  instagram         TEXT,
+  industry          TEXT,
+  brand_voice       TEXT,
+  target_audience   TEXT,
+  value_prop        TEXT,
+  dos               TEXT[] DEFAULT '{}',
+  donts             TEXT[] DEFAULT '{}',
+  brand_colors      TEXT[] DEFAULT '{}',
+  fonts             TEXT[] DEFAULT '{}',
+  keywords          TEXT[] DEFAULT '{}',
+  assigned_cm       TEXT,
+  assigned_designer TEXT,
+  stories_freq      TEXT,
+  posts_per_week    INT DEFAULT 3,
+  drive_folder_id   TEXT,
+  notion_page_id    TEXT,
+  extra             JSONB DEFAULT '{}',
+  created_at        TIMESTAMPTZ DEFAULT NOW(),
+  updated_at        TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_clients_agency ON clients(agency_id);
+CREATE INDEX idx_clients_extra  ON clients USING GIN(extra);
