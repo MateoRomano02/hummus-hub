@@ -1,0 +1,28 @@
+# Environments
+venv/
+.venv/
+env/
+python_env/
+.env
+
+# Python junk
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Project specific
+scratch/
