@@ -1,0 +1,788 @@
+
+
+
+HUMMUS BRAIN
+Architecture & Decision Record — v3 Final
+Post-auditoría · Correcciones aplicadas · Listo para Claude Code
+
+
+Stack final: Python · Notion · Supabase · Claude API · Google Drive API · Railway · GitHub
+
+
+
+
+
+
+
+0. Cambios aplicados en esta versión — qué se corrigió y por qué
+
+Esta sección documenta exactamente qué cambió desde v2 y la razón técnica de cada cambio. Es parte del ADR (Architecture Decision Record).
+
+Cambio
+Qué se corrigió
+Por qué
+R2 eliminado del piloto
+Cloudflare R2 removido del stack inicial
+R2 tiene sentido para el HEE (emails HTML). El HEE no existe aún. Agregar R2 antes de necesitarlo agrega complejidad sin valor. Se agrega cuando llegue la Fase 3.
+Sync simplificado
+Sync bidireccional automático → unidireccional + endpoint explícito
+El sync bidireccional automático tiene conflictos de escritura sin solución simple, Notion no tiene webhooks nativos confiables, y el 95% de las escrituras son Supabase→Notion. La dirección inversa se hace con endpoint explícito.
+Drive: agentes no rastrean en tiempo real
+Drive API con service account + registro explícito en Supabase
+Los agentes no pueden depender de rastrear Drive automáticamente. Service accounts requieren acceso explícito por carpeta. El flujo correcto es: team sube a Drive → registra en Supabase → agentes consultan Supabase.
+Brief como JSON schema formalizado
+Schema Pydantic del brief + Structured Outputs de Claude
+Sin schema formal el intake_agent devuelve estructuras inconsistentes. El schema Pydantic es la única fuente de verdad de qué campos tiene un brief.
+Versionado de prompts
+Prompt hash en agent_logs
+Sin esto no se puede saber qué versión del prompt generó qué output. Impide mejorar con datos.
+Error handling definido
+Retry logic + notificación + dead letter en agent_logs
+El blueprint anterior asumía happy path. Los agentes fallan. Hay que definir qué pasa cuando fallan antes de que pasen a producción.
+meetings diferida
+Tabla exists, flujo de Fase 3+
+La tabla existe en el schema pero no se construye el flujo. Requiere integración con Meet/Otter que no existe en Fase 1.
+
+
+1. Principios de diseño — versión final
+
+— Supabase es la única fuente de verdad
+Los agentes solo leen y escriben en Supabase. Notion muestra esos datos. Si Notion desaparece, el sistema sigue funcionando sin cambios.
+
+— Google Drive es repositorio, no fuente de datos en tiempo real
+El equipo trabaja en Drive como siempre. Los assets se registran explícitamente en Supabase cuando son relevantes para el sistema. Los agentes consultan Supabase, no Drive directamente, excepto para fetch puntual de contenido de un archivo específico.
+
+— Sync unidireccional por defecto
+Supabase → Notion: automático después de cada escritura de agente. Notion → Supabase: solo por endpoint explícito. Sin sync automático bidireccional.
+
+— Storage mínimo viable
+Solo el storage que se necesita hoy: Drive (ya existe) + Supabase (metadata). R2 se agrega cuando exista el HEE.
+
+— Schema híbrido flexible
+Columnas tipadas para lo estable y frecuentemente consultado. JSONB para lo variable, lo específico de cada cliente o rubro, y lo que puede crecer.
+
+— Multi-tenant desde el día 1
+agency_id en todas las tablas. RLS habilitado. Hoy una agencia, mañana muchas sin cambiar el schema.
+
+— Observabilidad desde el día 1
+agent_logs registra cada operación de cada agente: model, tokens, cache_hit, prompt_hash, duration, status. Sin esto no hay mejora posible.
+
+— Error handling explícito
+Cada agente tiene retry logic, timeout y dead letter. Los errores no se silencian, se loggean y se notifican.
+
+— Agnóstico de frontend
+FastAPI no sabe si el frontend es Notion, una web app o un bot. Los endpoints son la interfaz pública.
+
+
+2. Stack final — cada componente y su responsabilidad exacta
+
+Componente
+Responsabilidad
+Cuándo se agrega
+Supabase (PostgreSQL)
+Fuente de verdad. Todas las tablas del sistema. RLS habilitado. Queries de agentes.
+Día 1
+Notion Business (cuenta Mateo)
+UI para el equipo. Databases vinculadas a Supabase via sync. MCP para construcción inicial.
+Día 1
+FastAPI + Python
+Backend: expone agentes como endpoints HTTP. Recibe webhooks. Cron jobs vía APScheduler.
+Día 1
+Claude API (Haiku 4.5 + caching)
+Todos los agentes AI. Prompt caching activo para reducir costo en 90%.
+Día 4
+Google Drive API
+Lectura de assets cuando el agente necesita el contenido real de un archivo. Setup via service account.
+Día 2
+Railway (Hobby)
+Hosting de FastAPI. Deploy desde GitHub en push a main.
+Día 5
+GitHub (repo privado)
+Control de versiones. CI/CD hacia Railway. Historial de prompts.
+Día 1
+Cloudflare R2
+Assets con URL pública sin auth para emails HTML.
+Fase 3 — cuando exista HEE
+Meta Ads API
+Pull automático de métricas de pauta mensual.
+Fase 3
+Google Ads API
+Pull automático de métricas de Google Ads.
+Fase 3
+
+
+3. Arquitectura de storage — corregida
+
+Corrección aplicada vs v2
+v2 proponía que los agentes rastrearan Drive en tiempo real y que R2 fuera parte del stack inicial. Ambas cosas se corrigieron. El modelo correcto está abajo.
+
+3.1 Mapa de responsabilidades (versión final)
+
+Google Drive
+Donde el equipo trabaja hoy y seguirá trabajando. Logos, fotos, calendarios PPT, briefs, manuales de marca. No se migra nada. Los agentes acceden por file_id cuando necesitan el contenido de un archivo específico, no de forma continua.
+Supabase brand_assets
+El índice de todos los assets relevantes para el sistema. Guarda: file_id de Drive, URL de Drive, tipo de asset, cliente, label. Los agentes consultan esta tabla para saber qué existe — no rastrean Drive directamente.
+Cloudflare R2
+Fase 3+. Solo para assets que necesitan URL pública sin autenticación. Primero caso de uso: imágenes embebidas en HTML de emails del HEE.
+Notion embeds
+Links a Drive mostrados en Notion para que el equipo los vea sin salir del sistema. No es storage real.
+
+3.2 Flujo correcto de registro de un asset nuevo
+
+El equipo sube material a Drive como siempre. Para que el sistema lo 'conozca', se registra explícitamente:
+
+1. CM sube las fotos de la nueva campaña a la carpeta del cliente en Drive (proceso normal, sin cambios)
+2. CM abre el perfil del cliente en Notion y hace clic en 'Registrar asset nuevo' (un botón que llama al endpoint POST /assets/register)
+3. El endpoint recibe: client_id, file_id de Drive, tipo de asset, label opcional
+4. El backend llama a Drive API para verificar que el archivo existe y obtener los metadatos (nombre, mime_type, tamaño)
+5. Inserta en Supabase brand_assets: {client_id, drive_file_id, drive_url, asset_type, label, mime_type, file_size_kb}
+6. sync.py actualiza el perfil del cliente en Notion para mostrar el nuevo asset como embed
+7. A partir de ese momento, cualquier agente puede consultar los assets del cliente vía Supabase
+
+Por qué este flujo es más robusto
+No depende de que Drive notifique cambios (que no es confiable). No requiere que la service account tenga acceso a todas las carpetas automáticamente. El registro explícito es un paso de 10 segundos para el equipo y elimina bugs silenciosos donde el agente no encuentra un archivo y falla sin aviso.
+
+3.3 Cuándo y cómo los agentes leen Drive
+
+Los agentes consultan Supabase para saber qué assets existen. Solo llaman a Drive API cuando necesitan el contenido real del archivo — no para saber si existe.
+
+# Patrón correcto — agents/base_agent.py
+
+def get_client_context(client_id: str) -> dict:
+    # Los agentes siempre empiezan por Supabase
+    client = supabase.table('clients').select('*').eq('id', client_id).single().execute()
+    assets = supabase.table('brand_assets').select('*').eq('client_id', client_id).execute()
+
+    # Solo si hay un PDF de manual de marca, lo descarga para incluirlo en el contexto
+    manual = next((a for a in assets.data if a['asset_type'] == 'pdf_manual'), None)
+    manual_text = None
+    if manual:
+        manual_text = drive.download_as_text(manual['drive_file_id'])  # fetch puntual
+
+    return {
+        'profile': client.data,
+        'assets_index': assets.data,   # metadata de todos los assets
+        'manual_text': manual_text      # contenido solo si existe y es necesario
+    }
+
+
+4. Sincronización Notion ↔ Supabase — modelo simplificado
+
+Corrección aplicada vs v2
+v2 proponía sync bidireccional automático. Esto genera conflictos de escritura y depende de webhooks de Notion que no son confiables. El modelo correcto es asimétrico.
+
+4.1 El modelo correcto
+
+Supabase → Notion (automático)
+Cada vez que un agente escribe en Supabase, sync.py actualiza Notion inmediatamente después. Esta dirección es simple, no tiene conflictos y es el 95% del tráfico real.
+Notion → Supabase (explícito)
+Cuando Cami actualiza el perfil de un cliente en Notion (tono, donts, target), llama al endpoint POST /sync/pull/{client_id}. Este endpoint lee el estado actual de Notion y lo persiste en Supabase. No es automático, es intencional.
+
+4.2 Implementación del sync Supabase → Notion
+
+# notion/sync.py
+
+def push_to_notion(entity_type: str, entity_id: str, data: dict):
+    '''Llamado por los agentes después de cada escritura en Supabase.
+    entity_type: 'client' | 'task' | 'campaign' | 'decision' | 'metric'
+    '''
+    notion_id = get_notion_id(entity_type, entity_id)
+    if not notion_id:
+        # El registro no existe en Notion todavía — crearlo
+        notion_id = create_notion_page(entity_type, data)
+        save_notion_id(entity_type, entity_id, notion_id)
+        return
+    # Actualizar las propiedades de la página existente
+    notion.pages.update(notion_id, properties=build_notion_properties(entity_type, data))
+
+4.3 Implementación del sync Notion → Supabase (endpoint explícito)
+
+# api/routes/sync.py
+
+@app.post('/sync/pull/{client_id}')
+async def pull_from_notion(client_id: str):
+    '''Cami llama a esto desde un botón en Notion cuando termina de editar el perfil.
+    Lee el estado actual de la página del cliente en Notion y lo persiste en Supabase.
+    Último escritor gana. No hay conflictos porque es una acción explícita e intencional.
+    '''
+    notion_id = get_notion_id('client', client_id)
+    notion_data = notion.pages.retrieve(notion_id)
+    parsed = parse_notion_client_page(notion_data)
+    supabase.table('clients').update(parsed).eq('id', client_id).execute()
+    agent_logs.write('sync', client_id, {'direction': 'notion_to_supabase', 'fields': list(parsed.keys())})
+    return {'status': 'ok', 'fields_updated': list(parsed.keys())}
+
+
+
+5. Brief como JSON schema — la base del intake_agent
+
+El brief template del Drive tiene campos definidos. Esos campos se formalizan como un schema Pydantic. Claude usa Structured Outputs para garantizar que el intake siempre devuelve exactamente esos campos, sin variaciones.
+
+5.1 El schema Pydantic del brief
+
+# config/schemas/brief_schema.py
+from pydantic import BaseModel, Field
+from typing import Optional, List
+
+class BriefSchema(BaseModel):
+    # Identidad
+    client_name:         str
+    industry:            str
+    country:             str = 'AR'
+
+    # Contacto
+    email:               Optional[str] = None
+    whatsapp:            Optional[str] = None
+    website:             Optional[str] = None
+    instagram:           Optional[str] = None
+
+    # Perfil de marca — campos críticos para los agentes
+    brand_voice:         str   # Cómo habla la marca
+    five_brand_words:    List[str]   # 5 palabras que definen la marca
+    communication_objectives: List[str]   # mínimo 3
+    target_audience:     str   # a quién le habla
+    target_opportunity:  Optional[str] = None   # target potencial
+    value_proposition:   str   # qué la diferencia
+    competitors:         List[str] = []
+
+    # Reglas de contenido — las más consultadas por agentes
+    dos:                 List[str] = []
+    donts:               List[str] = []
+
+    # Estética
+    brand_colors:        List[str] = []   # hex
+    fonts:               List[str] = []
+    has_brand_manual:    bool = False
+    brand_manual_url:    Optional[str] = None
+    aesthetic_references: List[str] = []
+    content_references:  List[str] = []
+
+    # Operacional
+    stories_frequency:   Optional[str] = None
+    posts_per_week:      int = 3
+    most_important_event: Optional[str] = None
+    client_expectations: Optional[str] = None
+
+    # Extra — cualquier campo que no encaje arriba
+    extra:               dict = {}
+
+5.2 Cómo Claude usa este schema (Structured Outputs)
+
+# agents/intake_agent.py
+import anthropic, json
+from config.schemas.brief_schema import BriefSchema
+
+def process_brief_email(email_text: str) -> BriefSchema:
+    client = anthropic.Anthropic()
+    response = client.messages.create(
+        model='claude-haiku-4-5-20251001',
+        max_tokens=2000,
+        system=open('config/prompts/intake_system.txt').read(),
+        messages=[{
+            'role': 'user',
+            'content': f'Extraé los campos de este brief:\n\n{email_text}'
+        }],
+        tools=[{
+            'name': 'save_brief',
+            'description': 'Guarda el brief estructurado del cliente',
+            'input_schema': BriefSchema.model_json_schema()
+        }],
+        tool_choice={'type': 'tool', 'name': 'save_brief'}
+    )
+    # Claude está forzado a devolver el schema exacto — sin alucinaciones
+    raw = response.content[0].input
+    return BriefSchema(**raw)  # Pydantic valida que todos los campos sean correctos
+
+Por qué tool_choice forzado
+Al usar tool_choice: {type: 'tool', name: 'save_brief'}, Claude está obligado a llamar exactamente esa tool con exactamente ese schema. No puede devolver texto libre ni inventar campos. Si un campo no está en el email, devuelve el default del schema. Cero alucinaciones de estructura.
+
+
+6. Error handling y observabilidad — qué pasa cuando algo falla
+
+El blueprint anterior no definía qué pasa cuando un agente falla. Esto es el componente que más duele en producción si no está definido antes de llegar ahí.
+
+6.1 Patrón de error handling en todos los agentes
+
+# agents/base_agent.py
+import time, hashlib
+from functools import wraps
+
+MAX_RETRIES = 3
+RETRY_DELAYS = [2, 5, 15]  # segundos entre reintentos
+
+def run_with_retry(agent_fn, agent_type: str, client_id: str, **kwargs):
+    prompt_hash = hashlib.md5(open(f'config/prompts/{agent_type}_system.txt','rb').read()).hexdigest()[:8]
+    start = time.time()
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            result = agent_fn(**kwargs)
+            # Éxito — loggear y retornar
+            log_agent(agent_type, client_id, kwargs, result, prompt_hash,
+                      int((time.time()-start)*1000), 'success')
+            return result
+
+        except anthropic.RateLimitError:
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAYS[attempt])
+                continue
+            log_agent(agent_type, client_id, kwargs, None, prompt_hash,
+                      int((time.time()-start)*1000), 'error', 'rate_limit_exceeded')
+            notify_error(agent_type, client_id, 'rate_limit_exceeded')
+            raise
+
+        except Exception as e:
+            log_agent(agent_type, client_id, kwargs, None, prompt_hash,
+                      int((time.time()-start)*1000), 'error', str(e))
+            notify_error(agent_type, client_id, str(e))
+            raise
+
+6.2 Notificación de errores — simple y directo
+
+No hay Sentry, no hay PagerDuty. Para el piloto, un mail a vos cuando algo falla es suficiente y tarda 5 minutos en implementar.
+
+# config/notifications.py
+import smtplib
+from email.message import EmailMessage
+
+def notify_error(agent_type: str, client_id: str, error: str):
+    msg = EmailMessage()
+    msg['Subject'] = f'[Hummus Brain] Error en {agent_type}'
+    msg['From'] = 'brain@agenciahummus.com.ar'
+    msg['To'] = 'mateo@ejemplo.com'
+    msg.set_content(f'Agente: {agent_type}\nCliente: {client_id}\nError: {error}')
+    # Usar Gmail SMTP con app password — 10 minutos de setup
+    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as s:
+        s.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        s.send_message(msg)
+
+6.3 Versionado de prompts en agent_logs
+
+Cada ejecución de agente guarda el hash MD5 de los primeros 8 caracteres del system prompt. Cuando un prompt cambia, el hash cambia, y podés comparar el antes y el después en la tabla agent_logs.
+
+-- Consulta útil: comparar performance entre versiones de un prompt
+SELECT
+  prompt_hash,
+  COUNT(*) as total_calls,
+  AVG(tokens_out) as avg_tokens,
+  SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as errors,
+  AVG(duration_ms) as avg_ms
+FROM agent_logs
+WHERE agent_type = 'brief'
+GROUP BY prompt_hash
+ORDER BY MIN(created_at) DESC;
+
+
+
+7. Schema de Supabase — versión final con todas las correcciones
+
+Schema completo, incluyendo agent_logs con prompt_hash y meetings con nota de Fase 3.
+
+agencies
+CREATE TABLE agencies (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name       TEXT NOT NULL,
+  slug       TEXT UNIQUE NOT NULL,
+  plan       TEXT DEFAULT 'starter',
+  settings   JSONB DEFAULT '{}',
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+clients
+CREATE TABLE clients (
+  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agency_id         UUID NOT NULL REFERENCES agencies(id),
+  name              TEXT NOT NULL,
+  slug              TEXT NOT NULL,
+  status            TEXT DEFAULT 'active',
+  -- Contacto
+  email             TEXT,
+  whatsapp          TEXT,
+  website           TEXT,
+  instagram         TEXT,
+  -- Perfil de marca (columnas fijas: los agentes las usan siempre)
+  industry          TEXT,
+  brand_voice       TEXT,
+  target_audience   TEXT,
+  value_prop        TEXT,
+  dos               TEXT[] DEFAULT '{}',
+  donts             TEXT[] DEFAULT '{}',
+  brand_colors      TEXT[] DEFAULT '{}',
+  fonts             TEXT[] DEFAULT '{}',
+  keywords          TEXT[] DEFAULT '{}',
+  -- Operacional
+  assigned_cm       TEXT,
+  assigned_designer TEXT,
+  stories_freq      TEXT,
+  posts_per_week    INT DEFAULT 3,
+  -- Drive
+  drive_folder_id   TEXT,
+  -- Notion
+  notion_page_id    TEXT,
+  -- Flexible
+  extra             JSONB DEFAULT '{}',
+  created_at        TIMESTAMPTZ DEFAULT NOW(),
+  updated_at        TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_clients_agency ON clients(agency_id);
+CREATE INDEX idx_clients_extra  ON clients USING GIN(extra);
+
+services
+CREATE TABLE services (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agency_id  UUID NOT NULL REFERENCES agencies(id),
+  client_id  UUID NOT NULL REFERENCES clients(id),
+  type       TEXT NOT NULL,
+  -- social_media | meta_ads | google_ads | email_marketing
+  -- design | strategy | video_editing | seo | finances (futuro)
+  status     TEXT DEFAULT 'active',
+  started_at DATE,
+  config     JSONB DEFAULT '{}',
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+brand_assets
+CREATE TABLE brand_assets (
+  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agency_id      UUID NOT NULL REFERENCES agencies(id),
+  client_id      UUID NOT NULL REFERENCES clients(id),
+  asset_type     TEXT NOT NULL,
+  -- logo | logo_dark | photo | video | pdf_manual | pdf_brief | font
+  label          TEXT,
+  source         TEXT NOT NULL DEFAULT 'google_drive',
+  -- google_drive | r2 (Fase 3) | external_url
+  drive_file_id  TEXT,
+  drive_url      TEXT,
+  r2_key         TEXT,        -- null hasta Fase 3
+  r2_url         TEXT,        -- null hasta Fase 3
+  external_url   TEXT,
+  mime_type      TEXT,
+  file_size_kb   INT,
+  is_primary     BOOL DEFAULT false,
+  meta           JSONB DEFAULT '{}',
+  created_at     TIMESTAMPTZ DEFAULT NOW()
+);
+
+campaigns
+CREATE TABLE campaigns (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agency_id       UUID NOT NULL REFERENCES agencies(id),
+  client_id       UUID NOT NULL REFERENCES clients(id),
+  service_id      UUID REFERENCES services(id),
+  name            TEXT NOT NULL,
+  type            TEXT,
+  status          TEXT DEFAULT 'planning',
+  period_start    DATE,
+  period_end      DATE,
+  brief_raw       TEXT,
+  objective       TEXT,
+  outcome         TEXT,
+  learnings       TEXT,
+  drive_folder_id TEXT,
+  notion_page_id  TEXT,
+  extra           JSONB DEFAULT '{}',
+  created_at      TIMESTAMPTZ DEFAULT NOW(),
+  updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+content_items
+CREATE TABLE content_items (
+  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agency_id         UUID NOT NULL REFERENCES agencies(id),
+  client_id         UUID NOT NULL REFERENCES clients(id),
+  campaign_id       UUID REFERENCES campaigns(id),
+  type              TEXT NOT NULL,
+  platform          TEXT,
+  copy_text         TEXT,
+  brief_context     TEXT,   -- generado por brief_agent
+  audit_notes       TEXT,   -- generado por audit_agent
+  designed_until    DATE,
+  programmed_until  DATE,
+  published_at      TIMESTAMPTZ,
+  assigned_cm       TEXT,
+  assigned_designer TEXT,
+  status            TEXT DEFAULT 'planning',
+  drive_file_id     TEXT,
+  notion_block_id   TEXT,
+  extra             JSONB DEFAULT '{}'
+);
+CREATE INDEX idx_content_dates ON content_items(client_id, designed_until, programmed_until);
+
+decisions
+CREATE TABLE decisions (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agency_id       UUID NOT NULL REFERENCES agencies(id),
+  client_id       UUID NOT NULL REFERENCES clients(id),
+  campaign_id     UUID REFERENCES campaigns(id),
+  source          TEXT,   -- meeting | whatsapp | email | notion
+  content         TEXT NOT NULL,
+  context         TEXT,
+  decided_by      TEXT,
+  decided_at      TIMESTAMPTZ,
+  is_reversal     BOOL DEFAULT false,
+  reverses_id     UUID REFERENCES decisions(id),
+  notion_block_id TEXT
+);
+
+meetings — Fase 3+
+-- Tabla creada ahora, flujo se implementa en Fase 3
+-- Requiere integración con Google Meet API o Fireflies/Otter
+CREATE TABLE meetings (
+  id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agency_id             UUID NOT NULL REFERENCES agencies(id),
+  client_id             UUID NOT NULL REFERENCES clients(id),
+  date                  TIMESTAMPTZ NOT NULL,
+  type                  TEXT,
+  transcript_raw        TEXT,
+  summary               TEXT,
+  action_items          JSONB DEFAULT '[]',
+  decisions_extracted   JSONB DEFAULT '[]',
+  attendees             TEXT[] DEFAULT '{}',
+  drive_recording_id    TEXT,
+  notion_page_id        TEXT
+);
+
+metrics
+CREATE TABLE metrics (
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agency_id        UUID NOT NULL REFERENCES agencies(id),
+  client_id        UUID NOT NULL REFERENCES clients(id),
+  service_id       UUID REFERENCES services(id),
+  platform         TEXT NOT NULL,
+  period_start     DATE NOT NULL,
+  period_end       DATE NOT NULL,
+  -- Instagram orgánico
+  reach            INT,
+  impressions      INT,
+  interactions     INT,
+  saves            INT,
+  profile_visits   INT,
+  link_clicks      INT,
+  followers_start  INT,
+  followers_end    INT,
+  followers_gained INT GENERATED ALWAYS AS (followers_end - followers_start) STORED,
+  -- Pauta
+  spend            DECIMAL(12,2),
+  clicks_paid      INT,
+  conversions      INT,
+  roas             DECIMAL(10,4),
+  -- Email
+  emails_sent      INT,
+  open_rate        DECIMAL(5,4),
+  click_rate       DECIMAL(5,4),
+  revenue          DECIMAL(12,2),
+  -- Extensible
+  extra            JSONB DEFAULT '{}'
+);
+CREATE INDEX idx_metrics_client_period ON metrics(client_id, period_start, period_end);
+
+special_dates
+CREATE TABLE special_dates (
+  id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agency_id            UUID NOT NULL REFERENCES agencies(id),
+  name                 TEXT NOT NULL,
+  date                 DATE NOT NULL,
+  is_recurring         BOOL DEFAULT false,
+  type                 TEXT,
+  country              TEXT DEFAULT 'AR',
+  relevant_industries  TEXT[] DEFAULT '{}',
+  relevant_clients     UUID[] DEFAULT '{}',
+  lead_time_days       INT DEFAULT 14,
+  notes                TEXT,
+  extra                JSONB DEFAULT '{}'
+);
+
+team_members
+CREATE TABLE team_members (
+  id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agency_id             UUID NOT NULL REFERENCES agencies(id),
+  name                  TEXT NOT NULL,
+  role                  TEXT NOT NULL,
+  email                 TEXT,
+  is_external           BOOL DEFAULT false,
+  skills                TEXT[] DEFAULT '{}',
+  assigned_clients      UUID[] DEFAULT '{}',
+  capacity_weekly_hours INT,
+  meta                  JSONB DEFAULT '{}'
+);
+
+agent_logs — con prompt_hash (corrección aplicada)
+CREATE TABLE agent_logs (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agency_id    UUID NOT NULL REFERENCES agencies(id),
+  agent_type   TEXT NOT NULL,
+  client_id    UUID REFERENCES clients(id),
+  input_data   JSONB,
+  output_data  JSONB,
+  model_used   TEXT,
+  tokens_in    INT,
+  tokens_out   INT,
+  cache_hit    BOOL,
+  prompt_hash  TEXT,       -- MD5[:8] del system prompt usado
+  duration_ms  INT,
+  status       TEXT,       -- success | error | partial
+  error_msg    TEXT,
+  created_at   TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_logs_agent_type ON agent_logs(agent_type, created_at DESC);
+CREATE INDEX idx_logs_prompt     ON agent_logs(agent_type, prompt_hash);
+
+
+8. Row Level Security — aislamiento real entre tenants
+
+-- Habilitar RLS en todas las tablas que tienen agency_id
+ALTER TABLE clients        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE services       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE brand_assets   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE campaigns      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE content_items  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE decisions      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE meetings       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE metrics        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE special_dates  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE team_members   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_logs     ENABLE ROW LEVEL SECURITY;
+
+-- Política base: solo ves los datos de tu agency
+-- (Se replica para cada tabla)
+CREATE POLICY agency_isolation ON clients
+  FOR ALL
+  USING (agency_id = current_setting('app.current_agency_id')::UUID);
+
+-- En FastAPI, set antes de cada query:
+def set_agency_context(supabase_client, agency_id: str):
+    supabase_client.rpc('set_config', {
+        'setting': 'app.current_agency_id',
+        'value': agency_id
+    }).execute()
+
+
+
+9. Estructura del repositorio — final
+
+hummus-brain/
+├── notion/
+│   ├── client.py          # Wrapper Notion API
+│   ├── sync.py            # push_to_notion() + endpoint pull
+│   └── schemas.py         # Mapeo propiedades Notion ↔ Supabase
+├── supabase/
+│   ├── client.py          # Wrapper + set_agency_context()
+│   └── migrations/
+│       ├── 001_agencies.sql
+│       ├── 002_clients.sql
+│       ├── 003_services.sql
+│       ├── 004_brand_assets.sql
+│       ├── 005_campaigns.sql
+│       ├── 006_content_items.sql
+│       ├── 007_decisions.sql
+│       ├── 008_meetings.sql
+│       ├── 009_metrics.sql
+│       ├── 010_special_dates.sql
+│       ├── 011_team_members.sql
+│       ├── 012_agent_logs.sql
+│       └── 013_rls_policies.sql
+├── agents/
+│   ├── base_agent.py      # run_with_retry() + log_agent()
+│   ├── brief_agent.py     # Pre-brief con contexto de cliente
+│   ├── audit_agent.py     # Auditoría de drafts
+│   ├── intake_agent.py    # Brief por email → BriefSchema
+│   └── report_agent.py    # Draft de reporte mensual (Fase 3)
+├── integrations/
+│   ├── google_drive.py    # Service account setup + download_as_text()
+│   ├── meta_ads.py        # Fase 3
+│   └── google_ads.py      # Fase 3
+├── api/
+│   ├── main.py
+│   └── routes/
+│       ├── brief.py       # POST /brief
+│       ├── assets.py      # POST /assets/register
+│       ├── sync.py        # POST /sync/pull/{client_id}
+│       ├── clients.py     # CRUD de clientes
+│       └── intake.py      # POST /intake/email
+├── config/
+│   ├── settings.py        # pydantic-settings, carga .env
+│   ├── notifications.py   # notify_error() con Gmail SMTP
+│   ├── schemas/
+│   │   └── brief_schema.py  # BriefSchema Pydantic
+│   └── prompts/
+│       ├── brief_system.txt
+│       ├── audit_system.txt
+│       └── intake_system.txt
+├── scripts/
+│   ├── setup_notion.py    # Crea arquitectura Notion desde cero (usa MCP)
+│   ├── load_client.py     # Carga cliente en Notion + Supabase
+│   └── backfill.py        # Migra los 11 clientes actuales
+├── .env.example
+├── requirements.txt
+├── railway.toml
+└── README.md
+
+
+10. Variables de entorno — todas las necesarias
+
+Las marcadas con # Fase 3 no se configuran ahora.
+
+# Claude API
+ANTHROPIC_API_KEY=
+
+# Notion
+NOTION_API_KEY=             # notion.so/my-integrations
+NOTION_DATABASE_CLIENTS_ID=
+NOTION_DATABASE_TASKS_ID=
+NOTION_DATABASE_CAMPAIGNS_ID=
+NOTION_DATABASE_DECISIONS_ID=
+NOTION_DATABASE_METRICS_ID=
+NOTION_DATABASE_ASSETS_ID=
+
+# Supabase
+SUPABASE_URL=
+SUPABASE_KEY=               # anon key para el backend
+SUPABASE_SERVICE_KEY=       # service key para migraciones
+
+# Google Drive
+GOOGLE_SERVICE_ACCOUNT_JSON= # Path al JSON de la service account
+
+# Notificaciones de error
+GMAIL_USER=
+GMAIL_APP_PASSWORD=         # App password de Google (no la contraseña real)
+ERROR_NOTIFY_EMAIL=         # tu email
+
+# Agencia (para multi-tenant)
+HUMMUS_AGENCY_ID=           # UUID de Hummus en la tabla agencies
+
+# Fase 3 — no configurar ahora
+# CLOUDFLARE_R2_ACCOUNT_ID=
+# CLOUDFLARE_R2_ACCESS_KEY=
+# CLOUDFLARE_R2_SECRET_KEY=
+# CLOUDFLARE_R2_BUCKET=
+# META_ADS_ACCESS_TOKEN=
+# META_ADS_ACCOUNT_ID=
+# GOOGLE_ADS_CLIENT_ID=
+# GOOGLE_ADS_CLIENT_SECRET=
+# GOOGLE_ADS_REFRESH_TOKEN=
+
+
+11. Plan de la semana — paso a paso
+
+Día
+Qué se construye
+Entregable
+Día 1
+Repo GitHub. Estructura de carpetas. .env.example. Configurar MCP Notion en Claude Desktop. Con el MCP, pedirle a Claude que cree todas las databases de Notion (Clientes, Tareas, Campañas, Decisiones, Métricas, Assets, Calendario) con todas sus propiedades.
+Notion operativo con todas las databases creadas
+Día 2
+Proyecto Supabase. Correr las 13 migraciones SQL en orden. Cliente Python wrapper con set_agency_context(). Insertar la primera fila en agencies: Hummus.
+Schema completo en Supabase. RLS habilitado.
+Día 3
+google_drive.py con service account setup. POST /assets/register funcionando. sync.py dirección Supabase→Notion. load_client.py. Cargar el cliente demo en ambos sistemas con Cami/Yae.
+Primer cliente en Notion y Supabase. Demo listo.
+Día 4
+base_agent.py con run_with_retry() y prompt_hash. brief_agent.py. BriefSchema Pydantic. Endpoint POST /brief. notify_error() con Gmail SMTP.
+Primer agente funcional. Error handling operativo.
+Día 5
+Deploy en Railway desde GitHub. POST /sync/pull/{client_id} para el sync Notion→Supabase. README completo. Demo final con Cami y Yae.
+Sistema en producción. Demo funcionando.
+
+
+Hummus Brain Architecture & Decision Record v3 — Final · Abril 2026
+Mateo · Leer este documento completo antes de generar código con Claude Code
