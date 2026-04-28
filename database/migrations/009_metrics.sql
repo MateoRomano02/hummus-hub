@@ -1,0 +1,28 @@
+CREATE TABLE metrics (
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agency_id        UUID NOT NULL REFERENCES agencies(id),
+  client_id        UUID NOT NULL REFERENCES clients(id),
+  service_id       UUID REFERENCES services(id),
+  platform         TEXT NOT NULL,
+  period_start     DATE NOT NULL,
+  period_end       DATE NOT NULL,
+  reach            INT,
+  impressions      INT,
+  interactions     INT,
+  saves            INT,
+  profile_visits   INT,
+  link_clicks      INT,
+  followers_start  INT,
+  followers_end    INT,
+  followers_gained INT GENERATED ALWAYS AS (followers_end - followers_start) STORED,
+  spend            DECIMAL(12,2),
+  clicks_paid      INT,
+  conversions      INT,
+  roas             DECIMAL(10,4),
+  emails_sent      INT,
+  open_rate        DECIMAL(5,4),
+  click_rate       DECIMAL(5,4),
+  revenue          DECIMAL(12,2),
+  extra            JSONB DEFAULT '{}'
+);
+CREATE INDEX idx_metrics_client_period ON metrics(client_id, period_start, period_end);
