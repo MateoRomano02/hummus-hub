@@ -1,24 +1,49 @@
 import smtplib
-from email.message import EmailMessage
-import os
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import logging
+from config.settings import settings
 
-def notify_error(agent_type: str, client_id: str, error: str):
-    msg = EmailMessage()
-    msg['Subject'] = f'[Hummus Brain] Error en {agent_type}'
-    msg['From'] = 'brain@agenciahummus.com.ar'
-    msg['To'] = os.getenv('ERROR_NOTIFY_EMAIL', 'mateo@ejemplo.com')
-    msg.set_content(f'Agente: {agent_type}\nCliente: {client_id}\nError: {error}')
-    
-    gmail_user = os.getenv('GMAIL_USER')
-    gmail_app_pwd = os.getenv('GMAIL_APP_PASSWORD')
-    
-    if not gmail_user or not gmail_app_pwd:
-        print("No SMTP credentials configured. Error details:", error)
-        return
+logger = logging.getLogger(__name__)
+
+def notify_error(agent_type: str, client_id: str, error_msg: str):
+    """
+    Sends an error notification email using Gmail SMTP.
+    """
+    if not all([settings.gmail_user, settings.gmail_app_password, settings.error_notify_email]):
+        logger.warning("Notification skipped: SMTP configuration missing in .env")
+        return False
 
     try:
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as s:
-            s.login(gmail_user, gmail_app_pwd)
-            s.send_message(msg)
+        # Create message
+        msg = MIMEMultipart()
+        msg['From'] = settings.gmail_user
+        msg['To'] = settings.error_notify_email
+        msg['Subject'] = f"🚨 ERROR CRÍTICO: {agent_type} - Hummus Hub"
+
+        body = f"""
+        <html>
+        <body style="font-family: sans-serif;">
+            <h2 style="color: #d32f2f;">Falla en Agente: {agent_type}</h2>
+            <p>Se ha detectado un error crítico que requiere atención inmediata.</p>
+            <hr>
+            <p><strong>Cliente ID:</strong> {client_id}</p>
+            <p><strong>Error:</strong> {error_msg}</p>
+            <hr>
+            <p style="font-size: 0.8em; color: #666;">Este es un mensaje automático de Hummus Hub Observability.</p>
+        </body>
+        </html>
+        """
+        msg.attach(MIMEText(body, 'html'))
+
+        # Send email
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(settings.gmail_user, settings.gmail_app_password)
+            server.send_message(msg)
+        
+        logger.info(f"Notification sent successfully for {agent_type}")
+        return True
+
     except Exception as e:
-        print(f"Failed to send email notification: {e}")
+        logger.error(f"Failed to send notification: {str(e)}")
+        return False
