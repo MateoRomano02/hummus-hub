@@ -6,14 +6,15 @@ from functools import wraps
 MAX_RETRIES = 3
 RETRY_DELAYS = [2, 5, 15]
 
-from config.supabase_client import supabase
-import os
+from database.client import supabase_admin as supabase
+from config.notifications import notify_error
+from config.settings import settings
 
 def log_agent(agent_type: str, client_id: str, kwargs: dict, result, prompt_hash: str, duration: int, status: str, error: str = None):
     """
     Logs agent activity to Supabase agent_logs table.
     """
-    agency_id = os.getenv("DEFAULT_AGENCY_ID")
+    agency_id = settings.default_agency_id
     
     # Extract token usage if available in result (assuming Anthropic response format)
     tokens_in = getattr(result, 'usage', {}).input_tokens if hasattr(result, 'usage') else 0
@@ -61,12 +62,16 @@ def run_with_retry(agent_fn, agent_type: str, client_id: str, **kwargs):
             if attempt < MAX_RETRIES - 1:
                 time.sleep(RETRY_DELAYS[attempt])
                 continue
-            log_agent(agent_type, client_id, kwargs, None, prompt_hash, int((time.time() - start) * 1000), 'error', 'rate_limit_exceeded')
+            error_msg = 'rate_limit_exceeded'
+            log_agent(agent_type, client_id, kwargs, None, prompt_hash, int((time.time() - start) * 1000), 'error', error_msg)
+            notify_error(agent_type, client_id, error_msg)
             raise
 
         except Exception as e:
             if attempt < MAX_RETRIES - 1:
                 time.sleep(RETRY_DELAYS[attempt])
                 continue
-            log_agent(agent_type, client_id, kwargs, None, prompt_hash, int((time.time() - start) * 1000), 'error', str(e))
+            error_msg = str(e)
+            log_agent(agent_type, client_id, kwargs, None, prompt_hash, int((time.time() - start) * 1000), 'error', error_msg)
+            notify_error(agent_type, client_id, error_msg)
             raise

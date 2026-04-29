@@ -2,7 +2,7 @@ import os
 import json
 import anthropic
 from agents.base_agent import run_with_retry
-from config.supabase_client import supabase
+from database.client import supabase
 
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
