@@ -11,6 +11,16 @@ Construido usando FastAPI, Supabase, Notion y Claude (Haiku).
 - **Agentes AI:** Claude Haiku (Anthropic API).
 - **Backend:** FastAPI expone las APIs e interfaces.
 
+## Notion Hub (HQ)
+
+La interfaz en Notion está organizada bajo el **Hummus Agency HQ**, estructurada para escalabilidad:
+
+- **Master Dashboard**: Vista unificada de métricas y estados globales.
+- **Teamspaces**: Espacios dedicados por equipo (Team Flor & Angie, etc).
+- **Bases de Datos Maestro**: El contenedor de datos crudos (Clientes, Contenido, Campañas).
+- **Operaciones**: Centro de control de procesos internos.
+
+
 ## Requisitos Previos
 
 - Python 3.10+
